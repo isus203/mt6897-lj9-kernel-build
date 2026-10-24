@@ -129,6 +129,8 @@ jobs:
           clone prebuilts/bazel/linux-x86_64     platform/prebuilts/bazel/linux-x86_64
           clone prebuilts/jdk/jdk11              platform/prebuilts/jdk/jdk11
           clone prebuilts/build-tools            platform/prebuilts/build-tools
+          clone prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8 \
+                platform/prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8
 
           # The clang repository holds every clang release; take only the one this kernel needs.
           mkdir -p prebuilts/clang/host
@@ -147,10 +149,32 @@ jobs:
         run: |
           set -euo pipefail
           cd "$SRC/kernel"
+
+          # The TECNO archive lost this link from kernel/build; Kleaf globs build-tools/sysroot/**.
+          if [ ! -e build/kernel/build-tools/sysroot ]; then
+            ln -sfn ../../../prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8/sysroot build/kernel/build-tools/sysroot
+          fi
+
+          # Hermetic tools: every link in build-tools/path must resolve. cxx_extractor (Kythe indexing,
+          # from prebuilts/clang-tools) is not needed to build, so a dangling one is dropped.
+          dangling="$(find -L build/kernel/build-tools/path -type l || true)"
+          for l in $dangling; do
+            case "$(basename "$l")" in
+              cxx_extractor) echo "removing unused dangling $l"; rm -f "$l" ;;
+            esac
+          done
+          dangling="$(find -L build/kernel/build-tools/path -type l || true)"
+          if [ -n "$dangling" ]; then
+            echo "::error::dangling hermetic tool links:"
+            for l in $dangling; do echo "  $l -> $(readlink "$l")"; done
+            exit 1
+          fi
+
           missing=0
           for link in WORKSPACE kernel-6.1 build/bazel_common_rules external/bazel-skylib external/stardoc \
                       prebuilts/build-tools prebuilts/bazel/linux-x86_64 prebuilts/jdk/jdk11 \
-                      prebuilts/clang/host/linux-x86 tools/mkbootimg tools/bazel; do
+                      prebuilts/clang/host/linux-x86 tools/mkbootimg tools/bazel \
+                      prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8 build/kernel/build-tools/sysroot; do
             if [ ! -e "$link" ]; then
               echo "::error::$link -> $(readlink "$link" || echo '?') does not resolve"
               missing=1
@@ -158,6 +182,13 @@ jobs:
           done
           [ -x prebuilts/bazel/linux-x86_64/bazel ] || { echo "::error::bazel binary missing"; missing=1; }
           [ -d "prebuilts/clang/host/linux-x86/$CLANG_VERSION/bin" ] || { echo "::error::$CLANG_VERSION missing"; missing=1; }
+
+          # For diagnosis only: any other dangling links left in the workspace.
+          others="$(find -L . -path ./out -prune -o -type l -print 2>/dev/null | head -50 || true)"
+          if [ -n "$others" ]; then
+            echo "::warning::dangling links in kernel/ (not fatal, listed for diagnosis)"
+            for l in $others; do echo "  $l -> $(readlink "$l")"; done
+          fi
           exit $missing
 
       - name: Write kernel/build.config
