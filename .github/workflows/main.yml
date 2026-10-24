@@ -192,7 +192,9 @@ jobs:
           echo "DEFCONFIG_OVERLAYS=$overlays"
 
           export DEFCONFIG_OVERLAYS="$overlays"
-          export OUT_DIR="$OUT"
+          # MediaTek's _setup_env.sh always prefixes OUT_DIR with ROOT_DIR, so it must be relative.
+          # From src/kernel, ../../out is $OUT.
+          export OUT_DIR="../../out"
           export SOURCE_DATE_EPOCH="$(git -C ../kernel-6.1 log -1 --format=%ct 2>/dev/null || date +%s)"
 
           bash kernel_device_modules-6.1/build.sh
