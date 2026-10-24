@@ -57,6 +57,7 @@ env:
   AOSP: https://android.googlesource.com
   AOSP_BRANCH: main-kernel-build-2023
   CLANG_VERSION: clang-r487747c
+  LIBUFDT_COMMIT: 9b70f594cf149c7c73989c78f03d210f8aa1c1f6
   SRC: ${{ github.workspace }}/src
   OUT: ${{ github.workspace }}/out
 
@@ -137,6 +138,17 @@ jobs:
           git clone -q --depth 1 --filter=blob:none --sparse -b "$AOSP_BRANCH" \
             "$AOSP/platform/prebuilts/clang/host/linux-x86" prebuilts/clang/host/linux-x86
           git -C prebuilts/clang/host/linux-x86 sparse-checkout set "$CLANG_VERSION" kleaf
+
+          # The TECNO archive ships kernel-build-tools without mkdtboimg.py (used for dtbo.img).
+          # Take it from its source project, platform/system/libufdt, at a fixed commit.
+          tool=kernel/prebuilts/kernel-build-tools/linux-x86/bin/mkdtboimg.py
+          if [ ! -e "$tool" ]; then
+            curl -fsSL --retry 3 \
+              "$AOSP/platform/system/libufdt/+/$LIBUFDT_COMMIT/utils/src/mkdtboimg.py?format=TEXT" \
+              | base64 -d > "$tool"
+            chmod +x "$tool"
+            head -1 "$tool" | grep -q python || { echo "::error::mkdtboimg.py download failed"; exit 1; }
+          fi
 
           # Expected clang version must match the kernel
           grep -q "CLANG_VERSION=${CLANG_VERSION#clang-}" kernel-6.1/build.config.constants \
