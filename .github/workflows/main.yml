@@ -1,0 +1,235 @@
+# Build the TECNO MT6897 (Dimensity 8350) Android 15 kernel 6.1 and its vendor modules,
+# by default for the POVA 7 Ultra 5G (LJ9).
+#
+# Sources:
+#   kernel/ + vendor/  isus203/TECNO_MTK_kernel_modules      @ android15_kernel_modules_and_devicetree_mt6897
+#   kernel-6.1/        isus203/android_kernel_tecno_LJ9_mt6897 @ Android-15
+#                      (same source as TECNO_Kernel_OpenSource @ android15_kernel_MT6897)
+#   AOSP pieces the TECNO archive only links to (build/bazel_common_rules, external/*, prebuilts/clang,
+#   prebuilts/bazel, prebuilts/build-tools, prebuilts/jdk, system/tools/mkbootimg) are fetched from
+#   android.googlesource.com, branch main-kernel-build-2023 (the one the common-android14-6.1 manifest uses).
+#
+# The build itself is MediaTek's own kernel_device_modules-6.1/build.sh (Kleaf / Bazel).
+
+name: Build MT6897 LJ9 kernel and modules
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: "TECNO project config (kernel/configs/<project>_defconfig)"
+        type: choice
+        default: lj9_h972
+        options:
+          - lj9_h972          # POVA 7 Ultra 5G (LJ9)
+          - cm8_h973          # CAMON 40 Premier 5G
+          - x6856_h971
+          - x6856b_h971
+          - x6873_h972
+          - d8300evb_h973a    # MediaTek reference board
+          - none              # plain mgk_64_k61_defconfig, no project overlay
+      mode:
+        description: "Build variant"
+        type: choice
+        default: user
+        options: [user, userdebug, eng]
+      extra_overlays:
+        description: "Extra config fragments from kernel/configs, space-separated (e.g. tran_custom.config)"
+        type: string
+        default: ""
+      modules_ref:
+        description: "Branch of TECNO_MTK_kernel_modules"
+        type: string
+        default: android15_kernel_modules_and_devicetree_mt6897
+      kernel_repo:
+        description: "Repository with kernel-6.1"
+        type: string
+        default: isus203/android_kernel_tecno_LJ9_mt6897
+      kernel_ref:
+        description: "Branch of the kernel repository"
+        type: string
+        default: Android-15
+
+permissions:
+  contents: read
+
+env:
+  AOSP: https://android.googlesource.com
+  AOSP_BRANCH: main-kernel-build-2023
+  CLANG_VERSION: clang-r487747c
+  SRC: ${{ github.workspace }}/src
+  OUT: ${{ github.workspace }}/out
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/local/.ghcup /usr/share/swift /usr/local/share/powershell
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          sudo apt-get clean
+          df -h /
+
+      - name: Add swap
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Install host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends git git-lfs python3 rsync zip
+
+      - name: Checkout kernel modules and device tree
+        uses: actions/checkout@v4
+        with:
+          repository: isus203/TECNO_MTK_kernel_modules
+          ref: ${{ inputs.modules_ref }}
+          path: src
+          fetch-depth: 1
+
+      - name: Checkout kernel-6.1
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.kernel_repo }}
+          ref: ${{ inputs.kernel_ref }}
+          path: src/kernel-6.1
+          fetch-depth: 1
+
+      - name: Fetch AOSP build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SRC"
+
+          # git clone with retries (googlesource sometimes drops large clones)
+          clone() {
+            local dir="$1" project="$2"
+            for i in 1 2 3; do
+              rm -rf "$dir"
+              if git clone -q --depth 1 -b "$AOSP_BRANCH" "$AOSP/$project" "$dir"; then return 0; fi
+              echo "retry $i: $project"; sleep 15
+            done
+            return 1
+          }
+
+          clone build/bazel_common_rules         platform/build/bazel_common_rules
+          clone external/bazel-skylib            platform/external/bazel-skylib
+          clone external/stardoc                 platform/external/stardoc
+          clone system/tools/mkbootimg           platform/system/tools/mkbootimg
+          clone prebuilts/bazel/linux-x86_64     platform/prebuilts/bazel/linux-x86_64
+          clone prebuilts/jdk/jdk11              platform/prebuilts/jdk/jdk11
+          clone prebuilts/build-tools            platform/prebuilts/build-tools
+
+          # The clang repository holds every clang release; take only the one this kernel needs.
+          mkdir -p prebuilts/clang/host
+          git clone -q --depth 1 --filter=blob:none --sparse -b "$AOSP_BRANCH" \
+            "$AOSP/platform/prebuilts/clang/host/linux-x86" prebuilts/clang/host/linux-x86
+          git -C prebuilts/clang/host/linux-x86 sparse-checkout set "$CLANG_VERSION" kleaf
+
+          # Expected clang version must match the kernel
+          grep -q "CLANG_VERSION=${CLANG_VERSION#clang-}" kernel-6.1/build.config.constants \
+            || { echo "::error::kernel-6.1 wants a different clang:"; grep CLANG_VERSION kernel-6.1/build.config.constants; exit 1; }
+
+          du -sh build external system prebuilts kernel kernel-6.1 vendor 2>/dev/null || true
+
+      - name: Check that the TECNO workspace links resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SRC/kernel"
+          missing=0
+          for link in WORKSPACE kernel-6.1 build/bazel_common_rules external/bazel-skylib external/stardoc \
+                      prebuilts/build-tools prebuilts/bazel/linux-x86_64 prebuilts/jdk/jdk11 \
+                      prebuilts/clang/host/linux-x86 tools/mkbootimg tools/bazel; do
+            if [ ! -e "$link" ]; then
+              echo "::error::$link -> $(readlink "$link" || echo '?') does not resolve"
+              missing=1
+            fi
+          done
+          [ -x prebuilts/bazel/linux-x86_64/bazel ] || { echo "::error::bazel binary missing"; missing=1; }
+          [ -d "prebuilts/clang/host/linux-x86/$CLANG_VERSION/bin" ] || { echo "::error::$CLANG_VERSION missing"; missing=1; }
+          exit $missing
+
+      - name: Write kernel/build.config
+        run: |
+          # The TECNO archive leaves out the top-level build.config that MediaTek's scripts source.
+          cat > "$SRC/kernel/build.config" <<'EOF'
+          DEVICE_MODULES_DIR=kernel_device_modules-6.1
+          KERNEL_DIR=kernel_device_modules-6.1
+          . ${ROOT_DIR}/kernel_device_modules-6.1/build.config.mtk_kernel_device_modules
+          EOF
+          sed -i 's/^ *//' "$SRC/kernel/build.config"
+          cat "$SRC/kernel/build.config"
+
+      - name: Build kernel and modules
+        shell: bash
+        working-directory: src/kernel
+        env:
+          PROJECT: mgk_64_k61
+          MODE: ${{ inputs.mode }}
+          SANDBOX: "0"            # linux-sandbox needs user namespaces, blocked on GitHub runners
+          KLEAF_GKI_CHECKER: "no" # needs vendor/aosp_gki reference vmlinux, not part of the TECNO archive
+        run: |
+          set -euo pipefail
+          overlays=""
+          if [ "${{ inputs.project }}" != "none" ]; then
+            overlays="${{ inputs.project }}_defconfig"
+          fi
+          overlays="$(echo "$overlays ${{ inputs.extra_overlays }}" | xargs)"
+          for f in $overlays; do
+            [ -f "kernel_device_modules-6.1/kernel/configs/$f" ] || { echo "::error::no such overlay: $f"; exit 1; }
+          done
+          echo "DEFCONFIG_OVERLAYS=$overlays"
+
+          export DEFCONFIG_OVERLAYS="$overlays"
+          export OUT_DIR="$OUT"
+          export SOURCE_DATE_EPOCH="$(git -C ../kernel-6.1 log -1 --format=%ct 2>/dev/null || date +%s)"
+
+          bash kernel_device_modules-6.1/build.sh
+
+      - name: Collect artifacts
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          DIST="$OUT/dist"
+          mkdir -p artifacts
+          if [ ! -d "$DIST" ]; then
+            echo "::warning::no dist directory, build did not finish"
+            exit 0
+          fi
+          name="mt6897-${{ inputs.project }}-${{ inputs.mode }}"
+          find "$DIST" -maxdepth 3 -type f \( -name 'Image*' -o -name 'vmlinux' -o -name '*.dtb' -o -name 'dtbo.img' \
+               -o -name 'System.map' -o -name '.config' -o -name 'boot*.img' \) -exec cp -t artifacts {} + 2>/dev/null || true
+          (cd "$DIST" && find . -name '*.ko' -printf '%P\n' | zip -q -@ "$GITHUB_WORKSPACE/artifacts/${name}-modules.zip") || true
+          (cd "$DIST" && find . -name 'modules.load*' -o -name 'modules.dep' -o -name 'modules.alias' | zip -q -@ "$GITHUB_WORKSPACE/artifacts/${name}-modules.zip") || true
+          ls -lh artifacts
+          echo "NAME=$name" >> "$GITHUB_ENV"
+
+      - name: Upload kernel and modules
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME || 'mt6897-kernel' }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload full dist (for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME || 'mt6897-kernel' }}-dist
+          path: ${{ env.OUT }}/dist/
+          if-no-files-found: ignore
+          retention-days: 3
