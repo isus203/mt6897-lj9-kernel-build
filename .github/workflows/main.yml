@@ -218,32 +218,56 @@ jobs:
           sed -i 's/^ *//' "$SRC/kernel/build.config"
           cat "$SRC/kernel/build.config"
 
+      - name: Allow the Bazel sandbox
+        run: |
+          # Kleaf runs actions in linux-sandbox, which needs unprivileged user namespaces.
+          # Ubuntu 24.04 runners block them through AppArmor by default.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 2>/dev/null || true
+          # Some TECNO Makefiles reach headers through $(srctree)/../kernel_device_modules-6.1,
+          # which only exists next to kernel-6.1 inside the sandbox execroot. Mirror it here too.
+          ln -sfn kernel/kernel_device_modules-6.1 "$SRC/kernel_device_modules-6.1"
+
       - name: Build kernel and modules
         shell: bash
         working-directory: src/kernel
         env:
           PROJECT: mgk_64_k61
           MODE: ${{ inputs.mode }}
-          SANDBOX: "0"            # linux-sandbox needs user namespaces, blocked on GitHub runners
           KLEAF_GKI_CHECKER: "no" # needs vendor/aosp_gki reference vmlinux, not part of the TECNO archive
         run: |
           set -euo pipefail
-          # mgk_64_k61.bzl adds the Transsion module list only when tran_custom.config is an overlay;
-          # the project defconfig goes last so its settings win.
-          overlays=""
+          configs=kernel_device_modules-6.1/kernel/configs
+
+          # Fragments in merge order; the project defconfig goes last so its settings win.
+          fragments=""
           if [ "${{ inputs.tran_custom }}" = "true" ]; then
-            overlays="tran_custom.config"
+            fragments="tran_custom.config"
           fi
           if [ "${{ inputs.project }}" != "none" ]; then
-            overlays="$overlays ${{ inputs.project }}_defconfig"
+            fragments="$fragments ${{ inputs.project }}_defconfig"
           fi
-          overlays="$(echo "$overlays ${{ inputs.extra_overlays }}" | xargs)"
-          for f in $overlays; do
-            [ -f "kernel_device_modules-6.1/kernel/configs/$f" ] || { echo "::error::no such overlay: $f"; exit 1; }
+          fragments="$(echo "$fragments ${{ inputs.extra_overlays }}" | xargs)"
+          for f in $fragments; do
+            [ -f "$configs/$f" ] || { echo "::error::no such overlay: $f"; exit 1; }
           done
-          echo "DEFCONFIG_OVERLAYS=$overlays"
 
-          export DEFCONFIG_OVERLAYS="$overlays"
+          # MediaTek's _setup_env.sh exports DEFCONFIG_OVERLAYS unquoted, so only the first word of a
+          # list reaches Bazel. Concatenate the fragments into one file and pass its name instead.
+          # mgk_64_k61.bzl adds the Transsion module list when the name contains "tran_custom.config".
+          overlay=""
+          if [ -n "$fragments" ]; then
+            overlay="ci_${{ inputs.project }}"
+            [ "${{ inputs.tran_custom }}" = "true" ] && overlay="${overlay}_tran_custom.config" || overlay="${overlay}.config"
+            : > "$configs/$overlay"
+            for f in $fragments; do
+              { echo "# ---- $f"; cat "$configs/$f"; echo; } >> "$configs/$overlay"
+            done
+          fi
+          echo "fragments: $fragments"
+          echo "DEFCONFIG_OVERLAYS=$overlay"
+
+          export DEFCONFIG_OVERLAYS="$overlay"
           # MediaTek's _setup_env.sh always prefixes OUT_DIR with ROOT_DIR, so it must be relative.
           # From src/kernel, ../../out is $OUT.
           export OUT_DIR="../../out"
