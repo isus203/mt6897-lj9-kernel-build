@@ -33,6 +33,10 @@ on:
         type: choice
         default: user
         options: [user, userdebug, eng]
+      tran_custom:
+        description: "Add tran_custom.config (Transsion panels, NFC, audio; also enables the Transsion module list)"
+        type: boolean
+        default: true
       extra_overlays:
         description: "Extra config fragments from kernel/configs, space-separated (e.g. tran_custom.config)"
         type: string
@@ -224,9 +228,14 @@ jobs:
           KLEAF_GKI_CHECKER: "no" # needs vendor/aosp_gki reference vmlinux, not part of the TECNO archive
         run: |
           set -euo pipefail
+          # mgk_64_k61.bzl adds the Transsion module list only when tran_custom.config is an overlay;
+          # the project defconfig goes last so its settings win.
           overlays=""
+          if [ "${{ inputs.tran_custom }}" = "true" ]; then
+            overlays="tran_custom.config"
+          fi
           if [ "${{ inputs.project }}" != "none" ]; then
-            overlays="${{ inputs.project }}_defconfig"
+            overlays="$overlays ${{ inputs.project }}_defconfig"
           fi
           overlays="$(echo "$overlays ${{ inputs.extra_overlays }}" | xargs)"
           for f in $overlays; do
